@@ -131,6 +131,9 @@
   .inv .status.paid { background: #E3F5EE; color: #0B6B4B; }
   .inv .status.overdue { background: #FDEBDD; color: #9A3D07; }
   .inv .status.partial { background: #E0F2F7; color: #0E5E75; }
+  .inv .status.advance { background: #E6F7F5; color: #0B7A70; }
+  .inv.tpl-bold .status.advance { background: rgba(255,255,255,.18); color: #fff; }
+  .inv .paylist .tag { display: inline-block; margin-right: 4px; padding: 0 6px; border-radius: 999px; background: #E6F7F5; color: #0B7A70; font-size: 10px; font-weight: 700; }
   .inv .meta { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) max-content; gap: 28px; padding-top: 18px; padding-bottom: 20px; border-top: 1px solid var(--rule); }
   .inv .meta h4 { margin: 0 0 6px; font-size: 11px; font-weight: 700; color: var(--muted); }
   .inv .meta .strong { font-weight: 700; font-size: 13.5px; }
@@ -460,9 +463,10 @@
         <div class="panel p-4 sm:p-5" id="paymentsPanel">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <h2 class="sec-title" id="payTitle">Payments received</h2>
-            <button class="btn-ghost px-2.5 py-1.5 text-[13px]" data-action="add-payment"><span data-icon="wallet" data-size="16"></span>Record payment</button>
+            <button class="btn-ghost px-2.5 py-1.5 text-[13px]" data-action="add-payment"><span data-icon="wallet" data-size="16"></span><span id="payBtnLabel">Record payment</span></button>
           </div>
           <p class="mt-1 text-sm text-slate-500 dark:text-slate-400" id="payHint">Advances and part payments reduce the balance due.</p>
+          <div id="payTotals" class="mt-3 grid grid-cols-3 gap-2" hidden></div>
           <div id="paymentsList" class="mt-3 space-y-2"></div>
         </div>
 
@@ -889,6 +893,9 @@ const STATUS_CHIP = {
   declined: 'bg-red-50 text-red-700 dark:bg-red-950/60 dark:text-red-300'
 };
 const TYPE_LABEL = { invoice: 'Invoice', quotation: 'Quotation', receipt: 'Receipt' };
+// An advance is money received before the work is done (usually against a quotation); anything else is a payment
+const PAY_KINDS = [['advance', 'Advance'], ['payment', 'Payment']];
+const isAdvance = p => p.kind === 'advance';
 const TEMPLATES = ['modern', 'bold', 'classic', 'minimal'];
 const SWATCHES = ['#0F2A4A', '#173A63', '#0B7A70', '#0E9488', '#0B1220', '#B45309', '#7C3AED'];
 
@@ -997,7 +1004,7 @@ function normalizeDoc(d) {
   x.opts = Object.assign({ showBank: true, showSignature: true, showQR: true, showWords: true, showStamp: true, showNumbers: true, showDisc: 'auto' }, x.opts || {});
   Object.keys(x.client).forEach(k => { x.client[k] = x.client[k] == null ? '' : String(x.client[k]); });
   x.items = (Array.isArray(x.items) ? x.items : []).map(i => { const it = Object.assign({ id: uid(), name: '', desc: '', qty: 1, unit: 'item', rate: 0, disc: 0, taxable: true }, i); it.id = safeId(it.id); it.name = String(it.name ?? ''); it.desc = String(it.desc ?? ''); if (!UNITS.includes(it.unit)) it.unit = 'item'; return it; });
-  x.payments = (Array.isArray(x.payments) ? x.payments : []).map(p => { const y = Object.assign({ id: uid(), date: todayISO(), method: 'Bank transfer', ref: '', amount: 0 }, p); y.id = safeId(y.id); if (!METHODS.includes(y.method)) y.method = 'Other'; return y; });
+  x.payments = (Array.isArray(x.payments) ? x.payments : []).map(p => { const y = Object.assign({ id: uid(), date: todayISO(), method: 'Bank transfer', ref: '', amount: 0 }, p); y.id = safeId(y.id); if (!METHODS.includes(y.method)) y.method = 'Other'; y.kind = x.type === 'quotation' || y.kind === 'advance' ? 'advance' : 'payment'; return y; });
   return x;
 }
 function safeId(id) { return /^[\w-]{1,40}$/.test(String(id ?? '')) ? String(id) : uid(); }
@@ -1047,12 +1054,15 @@ function calc(doc) {
   const total = r2(sub - discount + tax + other);
   const paid = doc.type === 'receipt' && !doc.payments.length ? total : r2(doc.payments.reduce((a, p) => a + num(p.amount), 0));
   const balance = r2(total - paid);
-  return { lines, sub, lineDisc: r2(lineDisc), discount, taxBase, tax, other, total, paid, balance };
+  const advance = doc.type === 'receipt' && !doc.payments.length ? 0 : r2(doc.payments.filter(isAdvance).reduce((a, p) => a + num(p.amount), 0));
+  const received = r2(paid - advance);
+  return { lines, sub, lineDisc: r2(lineDisc), discount, taxBase, tax, other, total, paid, advance, received, balance };
 }
 function effStatus(doc, t = calc(doc)) {
   const today = todayISO();
   if (doc.type === 'receipt') return 'paid';
   if (doc.type === 'quotation') {
+    if (t.advance > 0 && ['draft', 'sent'].includes(doc.status)) return 'accepted';
     if (doc.status === 'sent' && doc.dueDate && doc.dueDate < today) return 'expired';
     return doc.status;
   }
@@ -1081,7 +1091,9 @@ function qrData(text) {
 function qrTextFor(doc, t) {
   const st = S.settings;
   if (st.qr.mode === 'url' && st.qr.url) return st.qr.url;
-  return `${st.company.name}\n${TYPE_LABEL[doc.type]} ${doc.number}\n${doc.type === 'receipt' ? 'Received' : 'Amount due'}: ${money(doc.type === 'receipt' ? t.paid : t.balance, doc.currency)}${doc.type !== 'receipt' ? '\nDue: ' + fmtDate(doc.dueDate) : ''}${st.company.website ? '\n' + st.company.website : ''}`;
+  const label = doc.type === 'receipt' ? (t.advance > 0 ? 'Advance received' : 'Received') : doc.type === 'quotation' && !t.advance ? 'Quoted total' : 'Amount due';
+  const amount = doc.type === 'receipt' ? t.paid : doc.type === 'quotation' && !t.advance ? t.total : Math.max(t.balance, 0);
+  return `${st.company.name}\n${TYPE_LABEL[doc.type]} ${doc.number}${t.advance > 0 && doc.type !== 'receipt' ? '\nAdvance received: ' + money(t.advance, doc.currency) : ''}\n${label}: ${money(amount, doc.currency)}${doc.type !== 'receipt' ? '\nDue: ' + fmtDate(doc.dueDate) : ''}${st.company.website ? '\n' + st.company.website : ''}`;
 }
 const invoiceRows = doc => doc.items.filter(i => i.name || i.desc || num(i.rate));
 function renderInvoice(doc, { exporting = false, logoSrc, page } = {}) {
@@ -1127,9 +1139,13 @@ function renderInvoice(doc, { exporting = false, logoSrc, page } = {}) {
     hasTax ? [`${esc(doc.taxName || 'Tax')} (${num(doc.taxRate)}%)`, money(t.tax, cur)] : null,
     t.other ? [esc(doc.otherLabel || 'Other charges'), money(t.other, cur)] : null
   ].filter(Boolean);
-  const paidRows = doc.type !== 'quotation' && t.paid ? `<tr><td>${doc.type === 'receipt' ? 'Amount received' : 'Paid to date'}</td><td class="r num">-${money(t.paid, cur)}</td></tr>` : '';
-  const balanceLabel = doc.type === 'quotation' ? 'Quoted total' : doc.type === 'receipt' ? 'Amount received' : (status === 'paid' ? 'Paid in full' : 'Balance due');
-  const balanceVal = doc.type === 'quotation' ? t.total : doc.type === 'receipt' ? t.paid : Math.max(t.balance, 0);
+  const paidRows = (t.advance ? `<tr><td>Advance received</td><td class="r num">-${money(t.advance, cur)}</td></tr>` : '')
+    + (t.received ? `<tr><td>${t.advance ? 'Payments received' : 'Paid to date'}</td><td class="r num">-${money(t.received, cur)}</td></tr>` : '');
+  const quoteAdv = doc.type === 'quotation' && t.advance > 0;
+  const settled = t.total > 0 && t.balance <= 0.004;
+  const balanceLabel = doc.type === 'quotation' ? (quoteAdv ? (settled ? 'Paid in full in advance' : 'Balance payable') : 'Quoted total')
+    : doc.type === 'receipt' ? (t.advance > 0 ? 'Advance received' : 'Amount received') : (status === 'paid' ? 'Paid in full' : 'Balance due');
+  const balanceVal = doc.type === 'quotation' ? (quoteAdv ? Math.max(t.balance, 0) : t.total) : doc.type === 'receipt' ? t.paid : Math.max(t.balance, 0);
   const wordsAmt = doc.type === 'quotation' ? t.total : doc.type === 'receipt' ? t.paid : t.total;
   const b = st.bank;
   const bankRows = [['Account name', b.accountName], ['Account no.', b.accountNo], ['Bank', b.bankName], ['Branch', b.branch], ['SWIFT', b.swift], ['Other', b.other]].filter(r => r[1]);
@@ -1139,8 +1155,10 @@ function renderInvoice(doc, { exporting = false, logoSrc, page } = {}) {
   const stamp = doc.opts.showStamp && stampMap[status] ? `<div class="stamp ${status}">${stampMap[status]}</div>` : '';
   const sig = st.signatory;
   const showSig = doc.opts.showSignature && (sig.image || sig.name);
-  const payList = doc.type !== 'quotation' && doc.payments.length ? `<div class="paylist"><h4>Payment history</h4>${doc.payments.map(p => `<div><span>${fmtDate(p.date)} · ${esc(p.method)}${p.ref ? ' · ' + esc(p.ref) : ''}</span><span class="num">${money(num(p.amount), cur)}</span></div>`).join('')}</div>` : '';
-  const statusChip = doc.type === 'receipt' ? '' : `<div class="status ${status}">${STATUS_LABEL[status] || ''}</div>`;
+  const payTitle = doc.type === 'quotation' ? 'Advance payments' : doc.type === 'receipt' ? 'Payment details' : 'Payment history';
+  const tagAdv = doc.type === 'invoice' && t.advance > 0;
+  const payList = doc.payments.length ? `<div class="paylist"><h4>${payTitle}</h4>${doc.payments.map(p => `<div><span>${tagAdv && isAdvance(p) ? '<b class="tag">Advance</b>' : ''}${fmtDate(p.date)} · ${esc(p.method)}${p.ref ? ' · ' + esc(p.ref) : ''}</span><span class="num">${money(num(p.amount), cur)}</span></div>`).join('')}</div>` : '';
+  const statusChip = doc.type === 'receipt' ? (t.advance > 0 ? '<div class="status advance">Advance payment</div>' : '') : `<div class="status ${status}">${STATUS_LABEL[status] || ''}</div>`;
 
   const hasRows = rows || pg.first;
   return `<div class="inv tpl-${esc(doc.template || 'modern')}${exporting ? ' export' : ''}${page ? ' paged' : ''}" style="--accent:${esc(doc.accent || '#0F2A4A')};--logo-h:${num(st.logoHeight) || 52}px${pg.fit ? `;width:${794 / pg.fit}px;height:${PAGE_H / pg.fit}px` : ''}">
@@ -1172,7 +1190,7 @@ function renderInvoice(doc, { exporting = false, logoSrc, page } = {}) {
           <table class="totals num">
             ${totals.map(([k, v]) => `<tr><td>${k}</td><td class="r">${v}</td></tr>`).join('')}
             <tr class="grand"><td>Total</td><td class="r">${money(t.total, cur)}</td></tr>
-            ${doc.type === 'invoice' ? paidRows : ''}
+            ${doc.type !== 'receipt' ? paidRows : ''}
           </table>
           <div class="balance"><span>${balanceLabel}</span><span class="num">${money(balanceVal, cur)}</span></div>
         </div>
@@ -1221,7 +1239,14 @@ function renderDashboard() {
   const invs = S.docs.filter(d => d.type === 'invoice' && d.currency === cur && !['draft', 'cancelled'].includes(d.status));
   const withT = invs.map(d => ({ d, t: calc(d), s: effStatus(d) }));
   const yearBilled = withT.filter(x => x.d.issueDate.startsWith(year)).reduce((a, x) => a + x.t.total, 0);
-  const collectedYear = withT.reduce((a, x) => a + x.d.payments.filter(p => (p.date || '').startsWith(year)).reduce((s, p) => s + num(p.amount), 0), 0);
+  // Money in: invoice payments plus advances on quotations. An advance carried onto an invoice keeps its id, so it counts once.
+  const advQuotes = S.docs.filter(d => d.type === 'quotation' && d.currency === cur && d.status !== 'declined' && d.payments.length);
+  const seenPay = new Set(); const moneyIn = [];
+  [...invs, ...advQuotes].forEach(d => d.payments.forEach(p => { if (!seenPay.has(p.id)) { seenPay.add(p.id); moneyIn.push(p); } }));
+  const collectedYear = moneyIn.filter(p => (p.date || '').startsWith(year)).reduce((s, p) => s + num(p.amount), 0);
+  const invoicedPayIds = new Set(S.docs.filter(d => d.type === 'invoice' && d.status !== 'cancelled').flatMap(d => d.payments.map(p => p.id)));
+  const advNotInvoiced = advQuotes.filter(q => !q.payments.some(p => invoicedPayIds.has(p.id)));
+  const advHeld = advNotInvoiced.reduce((a, q) => a + calc(q).advance, 0);
   const outstanding = withT.filter(x => x.t.balance > 0).reduce((a, x) => a + x.t.balance, 0);
   const overdue = withT.filter(x => x.s === 'overdue');
   const overdueAmt = overdue.reduce((a, x) => a + x.t.balance, 0);
@@ -1233,14 +1258,15 @@ function renderDashboard() {
   const card = (label, value, sub, tone = '') => `<div class="panel p-4"><div class="text-[13px] font-semibold text-slate-500 dark:text-slate-400">${label}</div><div class="num mt-1 truncate text-xl font-extrabold tracking-tight sm:text-2xl ${tone}" title="${esc(value)}">${value}</div><div class="mt-1 truncate text-xs text-slate-500 dark:text-slate-400">${sub}</div></div>`;
   $('#statCards').innerHTML =
     card('Billed this year', moneyShort(yearBilled, cur), `${withT.filter(x => x.d.issueDate.startsWith(year)).length} invoices`) +
-    card('Collected this year', moneyShort(collectedYear, cur), yearBilled ? `${Math.round(collectedYear / yearBilled * 100)}% of billed` : 'No payments yet', 'text-emerald-700 dark:text-emerald-400') +
+    card('Collected this year', moneyShort(collectedYear, cur), advHeld ? `Incl. ${moneyShort(advHeld, cur)} in advances` : yearBilled ? `${Math.round(collectedYear / yearBilled * 100)}% of billed` : collectedYear ? 'Advances and payments' : 'No payments yet', 'text-emerald-700 dark:text-emerald-400') +
     card('Outstanding', moneyShort(outstanding, cur), `${withT.filter(x => x.t.balance > 0).length} unpaid invoices`) +
     card('Overdue', moneyShort(overdueAmt, cur), overdue.length ? `${overdue.length} past due date` : 'Nothing overdue', overdue.length ? 'text-amber dark:text-amber-400' : '');
 
   // chart: last 6 months
   const months = []; const now = new Date();
   for (let i = 5; i >= 0; i--) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); months.push({ key: `${d.getFullYear()}-${pad(d.getMonth() + 1)}`, label: d.toLocaleDateString('en-GB', { month: 'short' }), billed: 0, coll: 0 }); }
-  withT.forEach(x => { const m = months.find(m => x.d.issueDate.startsWith(m.key)); if (m) m.billed += x.t.total; x.d.payments.forEach(p => { const pm = months.find(m => (p.date || '').startsWith(m.key)); if (pm) pm.coll += num(p.amount); }); });
+  withT.forEach(x => { const m = months.find(m => x.d.issueDate.startsWith(m.key)); if (m) m.billed += x.t.total; });
+  moneyIn.forEach(p => { const pm = months.find(m => (p.date || '').startsWith(m.key)); if (pm) pm.coll += num(p.amount); });
   const max = Math.max(1, ...months.map(m => Math.max(m.billed, m.coll)));
   UI.chart = { months, max, cur }; drawChart();
   $('#chartNote').textContent = `Last 6 months, ${cur}. Highest month ${moneyShort(max, cur)}.`;
@@ -1250,13 +1276,14 @@ function renderDashboard() {
   const att = [
     ...overdue.sort((a, b) => a.d.dueDate.localeCompare(b.d.dueDate)).map(x => ({ d: x.d, tone: 'amber', text: `${daysBetween(x.d.dueDate, todayISO())} days overdue`, amt: x.t.balance })),
     ...dueSoon.map(x => ({ d: x.d, tone: 'blue', text: x.d.dueDate === todayISO() ? 'Due today' : `Due in ${daysBetween(todayISO(), x.d.dueDate)} days`, amt: x.t.balance })),
-    ...openQ.filter(q => q.status === 'sent').map(q => ({ d: q, tone: 'slate', text: `Quote awaiting reply, valid to ${fmtDate(q.dueDate)}`, amt: calc(q).total }))
+    ...advNotInvoiced.map(q => ({ d: q, tone: 'blue', text: 'Advance received, not invoiced yet', amt: calc(q).advance })),
+    ...openQ.filter(q => q.status === 'sent' && !calc(q).advance).map(q => ({ d: q, tone: 'slate', text: `Quote awaiting reply, valid to ${fmtDate(q.dueDate)}`, amt: calc(q).total }))
   ].slice(0, 6);
   $('#attention').innerHTML = att.length ? att.map(a => `<button class="flex w-full items-center gap-3 rounded-xl border border-line p-3 text-left transition hover:border-brand dark:border-slate-800" data-open="${a.d.id}">
       <span class="h-9 w-1 shrink-0 rounded-full ${a.tone === 'amber' ? 'bg-amber' : a.tone === 'blue' ? 'bg-brand' : 'bg-slate-300 dark:bg-slate-600'}"></span>
       <span class="min-w-0 flex-1"><span class="block truncate text-sm font-bold">${esc(clientLabel(a.d.client))}</span><span class="block truncate text-xs text-slate-500 dark:text-slate-400">${esc(a.d.number)} · ${a.text}</span></span>
       <span class="num shrink-0 text-sm font-bold">${moneyShort(a.amt, a.d.currency)}</span></button>`).join('')
-    : `<p class="rounded-xl bg-slate-50 p-4 text-sm text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">All clear. No overdue invoices or payments due this week.${winRate !== null ? ` Quote acceptance rate: ${winRate}%.` : ''}</p>`;
+    : `<p class="rounded-xl bg-slate-50 p-4 text-sm text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">All clear. No overdue invoices, payments due this week or advances waiting to be invoiced.${winRate !== null ? ` Quote acceptance rate: ${winRate}%.` : ''}</p>`;
 
   // recent
   const recent = [...S.docs].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 6);
@@ -1291,7 +1318,7 @@ function drawChart() {
 /* ---------- Document list ---------- */
 function docRow(d) {
   const t = calc(d); const s = effStatus(d, t);
-  const sub = d.type === 'invoice' && t.balance > 0 && t.paid > 0 ? `Due ${money(t.balance, d.currency)}` : '';
+  const sub = d.type === 'invoice' && t.balance > 0 && t.paid > 0 ? `Due ${money(t.balance, d.currency)}` : d.type === 'quotation' && t.advance > 0 ? `Advance ${money(t.advance, d.currency)}` : d.type === 'receipt' && t.advance > 0 ? 'Advance' : '';
   const tone = d.type === 'invoice' ? 'bg-brand-50 text-brand dark:bg-brand/20 dark:text-teal-300' : d.type === 'quotation' ? 'bg-violet-50 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300' : 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300';
   return `<div class="flex items-center gap-1 border-b border-line py-1 last:border-0 dark:border-slate-800">
     <button class="flex min-w-0 flex-1 items-center gap-3 rounded-xl py-2.5 pr-1 text-left" data-open="${d.id}">
@@ -1352,9 +1379,11 @@ function syncTypeUI() {
   $('#wrap-due').hidden = d.type === 'receipt';
   $('#lbl-due').textContent = d.type === 'quotation' ? 'Valid until' : 'Due date';
   $('#lbl-issue').textContent = d.type === 'receipt' ? 'Payment date' : 'Issue date';
-  $('#paymentsPanel').hidden = d.type === 'quotation';
-  $('#payTitle').textContent = d.type === 'receipt' ? 'Payment received' : 'Payments received';
-  $('#payHint').textContent = d.type === 'receipt' ? 'Record how and when the money arrived. The receipt shows the amount received.' : 'Advances and part payments reduce the balance due.';
+  $('#payTitle').textContent = d.type === 'receipt' ? 'Payment received' : d.type === 'quotation' ? 'Advance payments' : 'Payments received';
+  $('#payBtnLabel').textContent = d.type === 'quotation' ? 'Record advance' : 'Record payment';
+  $('#payHint').textContent = d.type === 'receipt' ? 'Record how and when the money arrived. Set the type to Advance for an advance receipt.'
+    : d.type === 'quotation' ? 'Record money received before the work starts. Advances carry over when you convert this quotation to an invoice.'
+    : 'Set the type to Advance for money received before the work started. Advances and part payments reduce the balance due.';
   $('#taxFields').style.opacity = d.taxEnabled ? 1 : .5;
   $$('#taxFields input').forEach(i => i.disabled = !d.taxEnabled);
   $('#edTitle').textContent = (d.saved ? '' : 'New ') + TYPE_LABEL[d.type].toLowerCase().replace(/^./, c => d.saved ? c.toUpperCase() : c) + (d.saved ? ' ' + d.number : '');
@@ -1395,20 +1424,35 @@ function renderItems() {
 function autoGrow(el) { el.style.height = 'auto'; el.style.height = Math.min(el.scrollHeight + 2, 220) + 'px'; }
 function renderPayments() {
   const d = cur();
+  const quote = d.type === 'quotation';
   $('#paymentsList').innerHTML = d.payments.map(p => `
-    <div class="grid grid-cols-2 gap-2 rounded-xl border border-line p-2.5 sm:p-3 md:grid-cols-[1fr_1.2fr_1fr_1fr_auto] dark:border-slate-800" data-pay="${p.id}">
-      <div><label class="lbl text-xs">Date</label><input type="date" class="field" data-pk="date" value="${esc(p.date)}"></div>
-      <div><label class="lbl text-xs">Method</label><select class="field" data-pk="method">${METHODS.map(m => `<option ${m === p.method ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
-      <div><label class="lbl text-xs">Reference</label><input class="field" data-pk="ref" value="${esc(p.ref)}" placeholder="Txn / cheque no."></div>
-      <div><label class="lbl text-xs">Amount</label><input type="number" step="any" min="0" class="field num" data-pk="amount" value="${esc(p.amount)}" inputmode="decimal"></div>
-      <div class="col-span-2 flex items-end justify-end md:col-span-1"><button class="icon-btn hover:!text-red-600" data-pdel aria-label="Remove payment">${icon('trash', 16)}</button></div>
-    </div>`).join('') || (d.type === 'receipt' ? '<p class="rounded-xl bg-slate-50 p-3 text-sm text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">No payment recorded, so the receipt shows the full total as received.</p>' : '');
+    <div class="grid grid-cols-2 gap-2 rounded-xl border p-2.5 sm:grid-cols-6 sm:p-3 ${isAdvance(p) && !quote ? 'border-teal/40 bg-brand-50/50 dark:border-teal/30 dark:bg-brand/10' : 'border-line dark:border-slate-800'}" data-pay="${p.id}">
+      <div class="sm:col-span-2"><label class="lbl text-xs">Date</label><input type="date" class="field" data-pk="date" value="${esc(p.date)}"></div>
+      ${quote ? '' : `<div class="sm:col-span-2"><label class="lbl text-xs">Type</label><select class="field" data-pk="kind">${PAY_KINDS.map(([v, l]) => `<option value="${v}" ${v === p.kind ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`}
+      <div class="${quote ? 'sm:col-span-4' : 'sm:col-span-2'}"><label class="lbl text-xs">Method</label><select class="field" data-pk="method">${METHODS.map(m => `<option ${m === p.method ? 'selected' : ''}>${m}</option>`).join('')}</select></div>
+      <div class="${quote ? 'col-span-2' : ''} sm:col-span-3"><label class="lbl text-xs">Reference</label><input class="field" data-pk="ref" value="${esc(p.ref)}" placeholder="Txn / slip / cheque no."></div>
+      <div class="sm:col-span-2"><label class="lbl text-xs">Amount</label><input type="number" step="any" min="0" class="field num" data-pk="amount" value="${esc(p.amount)}" inputmode="decimal"></div>
+      <div class="flex items-end justify-end sm:col-span-1"><button class="icon-btn hover:!text-red-600" data-pdel aria-label="Remove ${quote || isAdvance(p) ? 'advance' : 'payment'}">${icon('trash', 16)}</button></div>
+    </div>`).join('') || (d.type === 'receipt' ? '<p class="rounded-xl bg-slate-50 p-3 text-sm text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">No payment recorded, so the receipt shows the full total as received.</p>'
+      : `<p class="rounded-xl bg-slate-50 p-3 text-sm text-slate-500 dark:bg-slate-800/50 dark:text-slate-400">${quote ? 'No advance recorded yet.' : 'No payments recorded yet.'}</p>`);
+  renderPayTotals();
+}
+function renderPayTotals() {
+  const d = cur(); const t = calc(d); const c = d.currency; const box = $('#payTotals');
+  box.hidden = d.type === 'receipt' || !d.payments.length;
+  if (box.hidden) return;
+  const cells = d.type === 'quotation' ? [['Quoted', t.total], ['Advance', t.advance], ['Balance', Math.max(t.balance, 0)]]
+    : [['Advance', t.advance], ['Payments', t.received], ['Balance', Math.max(t.balance, 0)]];
+  box.innerHTML = cells.map(([l, v], i) => `<div class="rounded-lg bg-slate-50 px-3 py-2 dark:bg-slate-800/50"><div class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">${l}</div><div class="num truncate text-sm font-bold ${i === 2 ? 'text-brand dark:text-teal-300' : ''}">${money(v, c)}</div></div>`).join('')
+    + (t.balance < -0.004 ? `<p class="col-span-3 text-xs font-semibold text-red-700 dark:text-red-400">${d.type === 'quotation' ? 'Advances are' : 'Payments are'} ${money(-t.balance, c)} more than the total.</p>` : '');
 }
 function updateTotals() {
   const d = cur(); const t = calc(d); const c = d.currency;
-  const cells = [['Subtotal', t.sub], ['Discount', -t.discount], [d.taxEnabled ? (d.taxName || 'Tax') : 'Tax', t.tax], ['Total', t.total], [d.type === 'quotation' ? 'Quoted' : d.type === 'receipt' ? 'Received' : 'Balance', d.type === 'quotation' ? t.total : d.type === 'receipt' ? t.paid : t.balance]];
+  const cells = [['Subtotal', t.sub], ['Discount', -t.discount], [d.taxEnabled ? (d.taxName || 'Tax') : 'Tax', t.tax], ['Total', t.total], d.type === 'quotation' ? (t.advance ? ['Balance', t.balance] : ['Quoted', t.total]) : d.type === 'receipt' ? ['Received', t.paid] : ['Balance', t.balance]];
   $('#liveTotals').innerHTML = cells.map(([l, v], i) => `<div class="${i < 3 ? 'hidden sm:block' : ''}"><div class="text-[11px] font-semibold text-slate-500 dark:text-slate-400">${esc(l)}</div><div class="num truncate text-[13px] sm:text-sm font-extrabold ${i === 4 ? 'text-brand dark:text-teal-300' : ''}" title="${money(v, c)}">${money(v, c)}</div></div>`).join('');
   $('#barTotal').textContent = money(cells[4][1], c);
+  $('#barLabel').textContent = d.type === 'quotation' ? (t.advance ? 'Balance payable' : 'Quoted total') : d.type === 'receipt' ? (t.advance ? 'Advance received' : 'Amount received') : 'Balance due';
+  if (d.type !== 'receipt') renderPayTotals();
   $$('#itemsList [data-item]').forEach((el, k) => { const a = el.querySelector('[data-iamt]'); if (a) a.textContent = money(t.lines[k], c); });
 }
 function renderPreview() {
@@ -1453,7 +1497,9 @@ function onItemField(el) {
 }
 function onPayField(el) {
   const row = el.closest('[data-pay]'); const p = cur().payments.find(x => x.id === row.dataset.pay); const k = el.dataset.pk;
-  p[k] = el.type === 'number' ? (el.value === '' ? '' : num(el.value)) : el.value; touch();
+  p[k] = el.type === 'number' ? (el.value === '' ? '' : num(el.value)) : el.value;
+  if (k === 'kind') renderPayments();
+  touch();
 }
 function addItem(item = {}, focus = true) {
   const d = cur();
@@ -1470,7 +1516,7 @@ function setType(type) {
   d.type = type;
   if (!wasSaved) d.number = peekNumber(type, d.issueDate);
   d.status = STATUSES[type][0][0];
-  if (type === 'quotation') { d.terms = 'custom'; d.dueDate = addDays(d.issueDate, S.settings.quoteValidity || 30); if (!d.termsText || d.termsText === S.settings.invoiceTerms) d.termsText = S.settings.quoteTerms; }
+  if (type === 'quotation') { d.payments.forEach(p => p.kind = 'advance'); d.terms = 'custom'; d.dueDate = addDays(d.issueDate, S.settings.quoteValidity || 30); if (!d.termsText || d.termsText === S.settings.invoiceTerms) d.termsText = S.settings.quoteTerms; }
   if (type === 'invoice') { d.terms = S.settings.terms; d.dueDate = addDays(d.issueDate, termDays(d.terms) ?? 14); if (!d.termsText || d.termsText === S.settings.quoteTerms) d.termsText = S.settings.invoiceTerms; }
   if (type === 'receipt') { d.terms = 'receipt'; if (d.termsText === S.settings.quoteTerms || d.termsText === S.settings.invoiceTerms) d.termsText = ''; }
   fillEditor(); touch();
@@ -1484,6 +1530,9 @@ function validateDoc(d) {
   if (!d.items.some(i => i.name.trim() || num(i.rate))) errs.push('Add at least one line item.');
   if (d.client.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(d.client.email)) errs.push('Check the client email address.');
   if (d.type === 'invoice' && d.dueDate && d.dueDate < d.issueDate) errs.push('The due date is before the issue date.');
+  if (d.payments.some(p => !(num(p.amount) > 0))) errs.push(`Enter an amount for each ${d.type === 'quotation' ? 'advance' : 'payment'}, or remove the empty one.`);
+  if (d.payments.some(p => !p.date)) errs.push(`Add the date of each ${d.type === 'quotation' ? 'advance' : 'payment'}.`);
+  if (d.type !== 'receipt' && d.payments.length) { const t = calc(d); if (t.balance < -0.004) errs.push(`${d.type === 'quotation' ? 'Advances' : 'Payments'} of ${money(t.paid, d.currency)} are more than the total of ${money(t.total, d.currency)}.`); }
   return errs;
 }
 function saveDoc({ silent = false } = {}) {
@@ -1491,6 +1540,7 @@ function saveDoc({ silent = false } = {}) {
   if (errs.length) { toast(errs[0], 'error'); return false; }
   d.items = d.items.filter(i => i.name.trim() || i.desc.trim() || num(i.rate));
   d.saved = true; d.updatedAt = Date.now();
+  if (d.type === 'quotation' && d.payments.length && ['draft', 'sent'].includes(d.status)) { d.status = 'accepted'; $('#f-status').value = 'accepted'; }
   commitNumber(d);
   const idx = S.docs.findIndex(x => x.id === d.id);
   if (idx >= 0) S.docs[idx] = clone(d); else S.docs.push(clone(d));
@@ -1522,7 +1572,9 @@ async function openDoc(id) {
   S.current = normalizeDoc(clone(d)); UI.dirty = false; persist(); go('editor');
 }
 function duplicateDoc(src, type = src.type) {
-  const d = normalizeDoc(clone(src)); d.id = uid(); d.type = type; d.saved = false; d.payments = type === 'receipt' ? d.payments : [];
+  const d = normalizeDoc(clone(src)); d.id = uid(); d.type = type; d.saved = false;
+  // Advances move with a quotation onto its invoice and keep their ids, so the money is never counted twice
+  d.payments = type === 'receipt' ? d.payments : type === 'invoice' && src.type === 'quotation' ? d.payments.map(p => Object.assign(p, { kind: 'advance' })) : [];
   d.status = STATUSES[type][0][0]; d.issueDate = todayISO(); d.createdAt = d.updatedAt = Date.now();
   d.items.forEach(i => i.id = uid()); delete d.sample;
   if (type === 'invoice') { d.terms = S.settings.terms; d.dueDate = addDays(d.issueDate, termDays(d.terms) ?? 14); if (src.type === 'quotation') { d.termsText = S.settings.invoiceTerms; d.reference = d.reference || src.number; } }
@@ -1534,17 +1586,19 @@ function convertQuote(id) {
   const q = S.docs.find(x => x.id === id); if (!q) return;
   if (q.status !== 'accepted') { q.status = 'accepted'; q.updatedAt = Date.now(); }
   S.current = duplicateDoc(q, 'invoice'); S.current.notes = S.settings.defaultNotes; UI.dirty = true; persist();
-  go('editor'); toast(`Invoice drafted from ${q.number}. Review and save it.`, 'success');
+  const adv = calc(S.current).advance;
+  go('editor'); toast(adv ? `Invoice drafted from ${q.number} with the ${money(adv, q.currency)} advance deducted. Review and save it.` : `Invoice drafted from ${q.number}. Review and save it.`, 'success');
 }
 function issueReceipt(id) {
   const inv = S.docs.find(x => x.id === id); if (!inv) return;
   const t = calc(inv); const last = inv.payments[inv.payments.length - 1];
   const amount = last ? num(last.amount) : t.balance;
+  const adv = inv.type === 'quotation' || (last ? isAdvance(last) : false);
   const r = newDoc('receipt', {
     client: clone(inv.client), currency: inv.currency, project: inv.project, reference: inv.number, template: inv.template, accent: inv.accent,
-    items: [{ id: uid(), name: `Payment against ${inv.number}`, desc: inv.project ? `Project: ${inv.project}` : '', qty: 1, unit: 'item', rate: amount, taxable: false }],
-    taxEnabled: false, payments: [last ? Object.assign(clone(last), { id: uid() }) : { id: uid(), date: todayISO(), method: 'Bank transfer', ref: '', amount }],
-    notes: 'Thank you for your payment.', termsText: ''
+    items: [{ id: uid(), name: `${adv ? 'Advance payment' : 'Payment'} ${inv.type === 'quotation' ? 'for' : 'against'} ${TYPE_LABEL[inv.type].toLowerCase()} ${inv.number}`, desc: inv.project ? `Project: ${inv.project}` : '', qty: 1, unit: 'item', rate: amount, taxable: false }],
+    taxEnabled: false, payments: [Object.assign(last ? clone(last) : { date: todayISO(), method: 'Bank transfer', ref: '', amount }, { id: uid(), kind: adv ? 'advance' : 'payment' })],
+    notes: adv ? 'Thank you for your advance payment. It will be deducted from your final invoice.' : 'Thank you for your payment.', termsText: ''
   });
   r.issueDate = r.payments[0].date || todayISO(); r.number = peekNumber('receipt', r.issueDate);
   S.current = r; UI.dirty = true; persist(); go('editor');
@@ -1561,31 +1615,43 @@ async function deleteDoc(id) {
 /* ---------- Payments ---------- */
 function recordPaymentModal(docId) {
   const d = docId ? S.docs.find(x => x.id === docId) : cur(); if (!d) return;
-  const t = calc(d);
+  const t = calc(d); const quote = d.type === 'quotation'; const bal = r2(Math.max(t.balance, 0));
+  // On an invoice, the first payment before any work defaults to an advance only when it is recorded on a draft
+  const kind0 = quote || (d.status === 'draft' && !d.payments.length) ? 'advance' : 'payment';
+  const quick = [['25%', r2(t.total * .25)], ['50%', r2(t.total * .5)], ['Full balance', bal]].filter(([, v]) => v > 0 && v <= bal + 0.004);
   openModal(`
-    <h2 class="text-lg font-extrabold">Record payment</h2>
-    <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">${esc(docTitle(d))} for ${esc(clientLabel(d.client))}. Balance ${money(Math.max(t.balance, 0), d.currency)}.</p>
+    <h2 class="text-lg font-extrabold">${quote ? 'Record advance' : 'Record payment'}</h2>
+    <p class="mt-1 text-sm text-slate-500 dark:text-slate-400">${esc(docTitle(d))} for ${esc(clientLabel(d.client))}. ${quote ? `Quoted ${money(t.total, d.currency)}${t.advance ? `, advance so far ${money(t.advance, d.currency)}` : ''}.` : `Balance ${money(bal, d.currency)}${t.advance ? ` after ${money(t.advance, d.currency)} advance` : ''}.`}</p>
     <form class="mt-4 grid grid-cols-2 gap-3" id="payForm">
-      <div class="col-span-2"><label class="lbl" for="pm-amt">Amount (${d.currency})</label><input id="pm-amt" name="amount" type="number" step="any" min="0.01" required class="field num text-lg font-bold" value="${Math.max(t.balance, 0) || ''}"></div>
+      ${quote ? '<input type="hidden" name="kind" value="advance">' : `<fieldset class="col-span-2"><legend class="lbl">Type</legend><div class="seg">${PAY_KINDS.map(([v, l]) => `<button type="button" data-kind="${v}" aria-pressed="${v === kind0}">${l}</button>`).join('')}</div><input type="hidden" name="kind" value="${kind0}"></fieldset>`}
+      <div class="col-span-2"><label class="lbl" for="pm-amt">${quote ? 'Advance amount' : 'Amount'} (${d.currency})</label><input id="pm-amt" name="amount" type="number" step="any" min="0.01" required class="field num text-lg font-bold" value="${bal || ''}">
+        ${quick.length ? `<div class="mt-2 flex flex-wrap gap-2">${quick.map(([l, v]) => `<button type="button" class="fchip min-h-9 px-3 text-xs" data-amt="${v}">${l} · ${money(v, d.currency)}</button>`).join('')}</div>` : ''}</div>
       <div><label class="lbl" for="pm-date">Date</label><input id="pm-date" name="date" type="date" class="field" value="${todayISO()}" required></div>
       <div><label class="lbl" for="pm-m">Method</label><select id="pm-m" name="method" class="field">${METHODS.map(m => `<option>${m}</option>`).join('')}</select></div>
       <div class="col-span-2"><label class="lbl" for="pm-ref">Reference</label><input id="pm-ref" name="ref" class="field" placeholder="Transaction or cheque number"></div>
-      ${docId ? '<label class="col-span-2 flex items-center gap-2 text-sm font-semibold"><input type="checkbox" name="receipt" class="h-4 w-4 accent-teal-600" checked>Create a receipt for this payment</label>' : ''}
-      <div class="col-span-2 mt-2 flex justify-end gap-2"><button type="button" class="btn-ghost" data-close>Cancel</button><button class="btn-primary">Record payment</button></div>
+      ${docId ? `<label class="col-span-2 flex items-center gap-2 text-sm font-semibold"><input type="checkbox" name="receipt" class="h-4 w-4 accent-teal-600" checked>Create a receipt for this ${quote ? 'advance' : 'payment'}</label>` : ''}
+      <div class="col-span-2 mt-2 flex justify-end gap-2"><button type="button" class="btn-ghost" data-close>Cancel</button><button class="btn-primary">${quote ? 'Record advance' : 'Record payment'}</button></div>
     </form>`);
-  $('#payForm').addEventListener('submit', e => {
+  const form = $('#payForm');
+  form.addEventListener('click', e => {
+    const k = e.target.closest('[data-kind]'); if (k) { form.kind.value = k.dataset.kind; $$('[data-kind]', form).forEach(b => b.setAttribute('aria-pressed', String(b === k))); }
+    const a = e.target.closest('[data-amt]'); if (a) { form.amount.value = a.dataset.amt; form.amount.focus(); }
+  });
+  form.addEventListener('submit', e => {
     e.preventDefault(); const f = new FormData(e.target);
-    const p = { id: uid(), date: f.get('date'), method: f.get('method'), ref: f.get('ref'), amount: num(f.get('amount')) };
+    const p = { id: uid(), date: f.get('date'), method: f.get('method'), ref: f.get('ref'), amount: r2(num(f.get('amount'))), kind: quote || f.get('kind') === 'advance' ? 'advance' : 'payment' };
     if (!(p.amount > 0)) return toast('Enter an amount greater than zero.', 'error');
+    if (d.type !== 'receipt' && p.amount > bal + 0.004) return toast(`That is more than the ${quote ? 'quoted balance' : 'balance'} of ${money(bal, d.currency)}.`, 'error');
     closeModal();
     if (docId) {
+      if (quote && ['draft', 'sent'].includes(d.status)) d.status = 'accepted';
       if (d.status === 'draft') d.status = 'sent';
       d.payments.push(p); d.updatedAt = Date.now();
       if (cur()?.id === d.id) { S.current = normalizeDoc(clone(d)); }
-      persist(true); toast(`Payment of ${money(p.amount, d.currency)} recorded`, 'success');
+      persist(true); toast(`${p.kind === 'advance' ? 'Advance' : 'Payment'} of ${money(p.amount, d.currency)} recorded`, 'success');
       if (f.get('receipt')) issueReceipt(d.id); else go(UI.view);
     } else {
-      d.payments.push(p); renderPayments(); touch(); toast('Payment added. Save to keep it.', 'success');
+      d.payments.push(p); renderPayments(); touch(); toast(`${p.kind === 'advance' ? 'Advance' : 'Payment'} added. Save to keep it.`, 'success');
     }
   });
 }
@@ -1889,7 +1955,10 @@ function printDoc(d = cur()) {
 }
 function shareText(d) {
   const t = calc(d); const co = S.settings.company;
-  const amt = d.type === 'quotation' ? `Quoted total: ${money(t.total, d.currency)}\nValid until: ${fmtDate(d.dueDate)}` : d.type === 'receipt' ? `Amount received: ${money(t.paid, d.currency)}` : `Amount due: ${money(Math.max(t.balance, 0), d.currency)}\nDue date: ${fmtDate(d.dueDate)}`;
+  const advLine = t.advance > 0 ? `Advance received: ${money(t.advance, d.currency)}\n` : '';
+  const amt = d.type === 'quotation' ? `Quoted total: ${money(t.total, d.currency)}\n${advLine}${t.advance ? `Balance payable: ${money(Math.max(t.balance, 0), d.currency)}` : `Valid until: ${fmtDate(d.dueDate)}`}`
+    : d.type === 'receipt' ? `${t.advance ? 'Advance received' : 'Amount received'}: ${money(t.paid, d.currency)}`
+    : `Total: ${money(t.total, d.currency)}\n${advLine}Amount due: ${money(Math.max(t.balance, 0), d.currency)}\nDue date: ${fmtDate(d.dueDate)}`;
   const b = S.settings.bank;
   const bank = d.type === 'invoice' && b.accountNo ? `\n\nPay to: ${b.accountName}\n${b.bankName}${b.branch ? ', ' + b.branch : ''}\nAccount: ${b.accountNo}` : '';
   return `Hello ${d.client.name || d.client.company || ''},\n\nPlease find ${d.type === 'invoice' ? 'invoice' : d.type === 'quotation' ? 'our quotation' : 'your payment receipt'} ${d.number}${d.project ? ' for ' + d.project : ''} from ${co.name}.\n\n${amt}${bank}\n\nThank you,\n${S.settings.signatory.name || co.name}\n${co.phone || ''}`.replace(/\n{3,}/g, '\n\n');
@@ -1944,8 +2013,8 @@ async function importJSON(file) {
 }
 function exportCSV() {
   if (!S.docs.length) return toast('There are no saved documents to export.', 'info');
-  const head = ['Number', 'Type', 'Status', 'Client', 'Contact', 'Email', 'Project', 'Issue date', 'Due / valid until', 'Currency', 'Subtotal', 'Discount', 'Tax', 'Other', 'Total', 'Paid', 'Balance'];
-  const rows = S.docs.map(d => { const t = calc(d); return [d.number, TYPE_LABEL[d.type], STATUS_LABEL[effStatus(d, t)], d.client.company, d.client.name, d.client.email, d.project, d.issueDate, d.dueDate, d.currency, t.sub, t.discount, t.tax, t.other, t.total, t.paid, t.balance]; });
+  const head = ['Number', 'Type', 'Status', 'Client', 'Contact', 'Email', 'Project', 'Issue date', 'Due / valid until', 'Currency', 'Subtotal', 'Discount', 'Tax', 'Other', 'Total', 'Advance', 'Paid', 'Balance'];
+  const rows = S.docs.map(d => { const t = calc(d); return [d.number, TYPE_LABEL[d.type], STATUS_LABEL[effStatus(d, t)], d.client.company, d.client.name, d.client.email, d.project, d.issueDate, d.dueDate, d.currency, t.sub, t.discount, t.tax, t.other, t.total, t.advance, t.paid, t.balance]; });
   const csv = [head, ...rows].map(r => r.map(v => { let s = String(v ?? ''); if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = "'" + s; return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }).join(',')).join('\r\n');
   downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), `getmycv-documents-${todayISO()}.csv`);
   toast('CSV exported', 'success');
@@ -1971,9 +2040,10 @@ function loadSample() {
   const a = mk('invoice', c1, [svc('Professional package'), svc('Express delivery')], { issueDate: addDays(t, -75), dueDate: addDays(t, -68), status: 'sent', project: 'Software engineer CV and LinkedIn profile' });
   a.payments = [{ id: uid(), date: addDays(t, -74), method: 'Card (Stripe)', ref: 'GMC-2026-4821', amount: 35 }];
   const b = mk('invoice', c2, [svc('Premium package'), svc('Custom domain setup'), svc('Portfolio maintenance (1 year)')], { issueDate: addDays(t, -38), dueDate: addDays(t, -8), terms: 'net30', status: 'sent', project: 'Finance graduate CV and portfolio website' });
-  b.payments = [{ id: uid(), date: addDays(t, -30), method: 'Bank transfer', ref: 'Slip 004512', amount: 40 }];
+  b.payments = [{ id: uid(), date: addDays(t, -38), method: 'Bank transfer', ref: 'Slip 004512', amount: 40, kind: 'advance' }];
   mk('invoice', c3, [svc('Starter package'), svc('Extra revision round')], { issueDate: addDays(t, -6), dueDate: addDays(t, 1), status: 'sent', project: 'Hospitality management CV' });
-  mk('quotation', c3, [svc('Premium package'), svc('Custom domain setup')], { issueDate: addDays(t, -3), dueDate: addDays(t, 27), status: 'sent', project: 'Portfolio website upgrade' });
+  const q = mk('quotation', c3, [svc('Premium package'), svc('Custom domain setup')], { issueDate: addDays(t, -3), dueDate: addDays(t, 27), status: 'accepted', project: 'Portfolio website upgrade' });
+  q.payments = [{ id: uid(), date: addDays(t, -2), method: 'Card (Stripe)', ref: 'GMC-2026-5170', amount: 30, kind: 'advance' }];
   const r = mk('receipt', c1, [{ name: `Payment against ${a.number}`, unit: 'item', rate: 35, taxable: false }], { issueDate: addDays(t, -74) });
   r.payments = [{ id: uid(), date: addDays(t, -74), method: 'Card (Stripe)', ref: 'GMC-2026-4821', amount: 35 }];
   persist(true); renderDashboard(); toast('Sample data loaded. Erase it any time from Settings.', 'success');
@@ -2037,8 +2107,9 @@ function docMenu(id) {
   actionSheet(docTitle(d), [
     { icon: 'edit', label: 'Open', run: () => openDoc(id) },
     d.type === 'invoice' && t.balance > 0 && d.status !== 'cancelled' ? { icon: 'wallet', label: 'Record payment', hint: `Balance ${money(t.balance, d.currency)}`, run: () => recordPaymentModal(id) } : null,
-    d.type === 'invoice' && t.paid > 0 ? { icon: 'receipt', label: 'Issue receipt', hint: 'For the latest payment', run: () => issueReceipt(id) } : null,
-    d.type === 'quotation' ? { icon: 'swap', label: 'Convert to invoice', hint: 'Marks this quotation accepted', run: () => convertQuote(id) } : null,
+    d.type === 'quotation' && d.status !== 'declined' && t.balance > 0 ? { icon: 'wallet', label: 'Record advance', hint: t.advance ? `Advance so far ${money(t.advance, d.currency)}` : 'Money received before the work starts', run: () => recordPaymentModal(id) } : null,
+    d.type !== 'receipt' && t.paid > 0 ? { icon: 'receipt', label: 'Issue receipt', hint: `For the latest ${isAdvance(d.payments[d.payments.length - 1]) ? 'advance' : 'payment'}`, run: () => issueReceipt(id) } : null,
+    d.type === 'quotation' ? { icon: 'swap', label: 'Convert to invoice', hint: t.advance ? `Carries the ${money(t.advance, d.currency)} advance over` : 'Marks this quotation accepted', run: () => convertQuote(id) } : null,
     { icon: 'download', label: 'Download PDF', run: () => downloadPdf(normalizeDoc(clone(d))) },
     { icon: 'printer', label: 'Print', run: () => printDoc(normalizeDoc(clone(d))) },
     { icon: 'copy', label: 'Duplicate', hint: 'New number, today\'s date', run: () => { S.current = duplicateDoc(d); UI.dirty = true; persist(); go('editor'); toast('Copy created. Save it when ready.'); } },
@@ -2050,7 +2121,7 @@ function editorMoreMenu() {
   const d = cur(); const saved = S.docs.find(x => x.id === d.id);
   actionSheet('More actions', [
     d.type === 'quotation' && saved ? { icon: 'swap', label: 'Convert to invoice', run: () => convertQuote(d.id) } : null,
-    d.type === 'invoice' && saved && calc(d).paid > 0 ? { icon: 'receipt', label: 'Issue receipt', run: () => issueReceipt(d.id) } : null,
+    d.type !== 'receipt' && saved && calc(saved).paid > 0 ? { icon: 'receipt', label: 'Issue receipt', run: () => issueReceipt(d.id) } : null,
     { icon: 'copy', label: 'Duplicate', run: () => { S.current = duplicateDoc(d); UI.dirty = true; persist(); fillEditor(); toast('Copy created. Save it when ready.'); } },
     { icon: 'share', label: 'Share', hint: 'WhatsApp, email or another app', run: () => shareModal() },
     { icon: 'printer', label: 'Print', run: () => printDoc() },
@@ -2185,7 +2256,7 @@ document.addEventListener('click', async e => {
     case 'new-menu': return newMenu();
     case 'add-item': return addItem();
     case 'open-catalog': return catalogModal();
-    case 'add-payment': { const d = cur(); const t = calc(d); const bal = d.type === 'receipt' && !d.payments.length ? t.total : t.balance; d.payments.push({ id: uid(), date: todayISO(), method: 'Bank transfer', ref: '', amount: bal > 0 ? bal : 0 }); renderPayments(); touch(); $('#paymentsList [data-pay]:last-child [data-pk=amount]')?.focus(); return; }
+    case 'add-payment': { const d = cur(); const t = calc(d); const bal = d.type === 'receipt' && !d.payments.length ? t.total : t.balance; d.payments.push({ id: uid(), date: todayISO(), method: 'Bank transfer', ref: '', amount: bal > 0 ? bal : 0, kind: d.type === 'quotation' ? 'advance' : 'payment' }); renderPayments(); touch(); $('#paymentsList [data-pay]:last-child [data-pk=amount]')?.focus(); return; }
     case 'regen-number': { const d = cur(); d.number = peekNumber(d.type, d.issueDate); $('#f-number').value = d.number; touch(); return; }
     case 'pick-client': return pickClientModal();
     case 'save-client': { const c = cur().client; if (!(c.name || c.company).trim()) return toast('Add a client name or company first.', 'error'); autoSaveClient(c); persist(); return toast(`${clientLabel(c)} saved to clients`, 'success'); }
